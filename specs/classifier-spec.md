@@ -91,10 +91,24 @@ the format below:" followed by the output format you chose.
 **What output format should you request from the LLM?**
 
 ```
-[blank — you need to parse the response in classify_episode(). What format
-makes parsing reliable? Think about: a single label on its own line?
-A structured format like "Label: X / Reasoning: Y"? JSON?
-What are the tradeoffs?]
+DECISION: A keyed two-line format —
+
+    Label: <one of interview|solo|panel|narrative>
+    Reasoning: <one or two sentences>
+
+Why this over the alternatives:
+- vs. JSON: JSON is clean when valid, but LLMs often wrap it in ```json
+  fences, add preamble, or emit invalid JSON (unescaped quotes inside the
+  reasoning string). That forces fallback parsing anyway.
+- vs. "label alone on the first line": fragile if the model prepends filler
+  ("Sure! interview") — you can't tell which token is the label.
+- The keyed format is the most parse-TOLERANT: scan lines for the one
+  starting with "Label:", take the text after the colon, strip + lowercase,
+  and validate. Preamble or extra prose doesn't break it, and even a partial
+  response still yields a recoverable label.
+
+Parsing matters more than elegance here: the eval loop calls this 20×, and
+one malformed response must not crash the run.
 ```
 
 ---
@@ -102,8 +116,16 @@ What are the tradeoffs?]
 **Edge cases to handle in the prompt:**
 
 ```
-[blank — what if labeled_examples is empty? What if the description is very
-short? How does your prompt handle these?]
+- Empty labeled_examples: still emit a valid prompt with the task
+  instruction and label definitions (the definitions act as a zero-shot
+  fallback), just omit the examples block. Don't crash.
+- Very short / thin description: pass it through unchanged. The task
+  instruction already tells the model to classify by format; a short
+  description simply gives the model less to go on, which is acceptable —
+  it can still reason from whatever signal exists.
+- Always close the prompt with the explicit output-format instruction so the
+  model returns the keyed "Label:" / "Reasoning:" format regardless of how
+  many examples were included.
 ```
 
 ---
@@ -158,9 +180,14 @@ Extract the response text from:
 **Step 3 — Parse the response:**
 
 ```
-[blank — how do you extract the label and reasoning from the LLM's text output?
-What string operations or parsing logic do you need?
-This depends on the output format you chose in build_few_shot_prompt.]
+Split the response text into lines. Scan for the first line whose stripped,
+lowercased form starts with "label:" — take the text after the colon, strip
+it, lowercase it. That is the candidate label.
+
+For reasoning: find the line starting with "reasoning:" and take the text
+after its colon. If no explicit "Reasoning:" line exists, fall back to using
+the whole response text (or everything after the label line) as the
+reasoning, so we never return an empty explanation.
 ```
 
 ---
@@ -168,8 +195,11 @@ This depends on the output format you chose in build_few_shot_prompt.]
 **Step 4 — Validate the label:**
 
 ```
-[blank — what do you do if the LLM returns a label that isn't in VALID_LABELS?
-What should label be set to?]
+Check the parsed candidate label against VALID_LABELS (the lowercased,
+stripped string must be an exact member). If it matches, use it. If it does
+not match — empty, misspelled, capitalized differently after normalization,
+or the model returned prose with no parseable label — set label to
+"unknown". Never return a label outside VALID_LABELS ∪ {"unknown"}.
 ```
 
 ---
@@ -177,9 +207,16 @@ What should label be set to?]
 **Step 5 — Handle errors gracefully:**
 
 ```
-[blank — what could go wrong? (Network error? Unparseable response?)
-What should the function return if something fails?
-Hint: the evaluation loop runs 20 calls — one bad response shouldn't crash everything.]
+Wrap the API call and parsing in a try/except. Things that can go wrong:
+- Network / API error, rate limit, or timeout from Groq.
+- Empty or None response content.
+- Response with no parseable "Label:" line (handled in Step 4 → "unknown").
+
+On any exception, do NOT raise. Return:
+    {"label": "unknown", "reasoning": "Error: <message>"}
+so the evaluation loop's 20 calls continue even if one fails. A label of
+"unknown" simply counts as an incorrect prediction rather than crashing
+the run.
 ```
 
 ---
@@ -212,24 +249,48 @@ any labels you're unsure about. Annotation quality is part of the lab.
 **Test: what does the raw LLM response look like for one episode?**
 
 ```
-Episode tested: [title]
-Raw response text: [paste it here]
+Episode tested: "Chef Marco Reyes joins us..." (a host+guest interview description)
+
+Raw response text (exact, via repr()):
+'Label: interview\nReasoning: The episode features a conversation between a
+host and a single guest, Chef Marco Reyes, discussing his experiences and
+opinions, which is characteristic of an interview format. The description
+mentions "we ask him" and "he talks", indicating a conversation between the
+host and the guest.'
+
+The model returned exactly the requested two-line keyed format — "Label:"
+on the first line, "Reasoning:" on the second — with no preamble, no code
+fences, and no trailing prose.
 ```
 
 **How did you parse the label out of the response?**
 
 ```
-[describe the string operations — strip, split, lower, etc.]
+splitlines() over the response, then for each line: strip() it, lower() a
+copy, and check str.startswith("label:"). On the first match, take
+line.split(":", 1)[1], then .strip().lower() to get the bare label token.
+Reasoning is extracted the same way from the "reasoning:" line, with a
+fallback to the whole stripped response if no Reasoning line is present.
+Finally the label is checked for membership in VALID_LABELS; anything else
+becomes "unknown".
 ```
 
 **Did any episodes return `"unknown"`? If so, why?**
 
 ```
-[yes / no — if yes, what did the raw response look like?]
+No. All four test descriptions (one per label) parsed cleanly and returned
+the correct label. The model consistently honored the keyed format, so the
+"unknown" path was only exercised by deliberate error/validation handling,
+not by real responses.
 ```
 
 **One thing about the output format that surprised you:**
 
 ```
-[your answer here]
+How reliably the 70b model stuck to the exact format — no markdown fences,
+no "Sure, here's the classification:" preamble, no extra blank lines. I'd
+braced for messier output (which is why the parser scans for the "Label:"
+prefix rather than assuming line 1 is the label), and that tolerance turned
+out to be insurance I didn't end up needing — but it's cheap and makes the
+20-call eval loop robust to the one response that eventually won't conform.
 ```
